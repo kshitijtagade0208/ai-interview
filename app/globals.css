@@ -1,26 +1,73 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  --bg-main: #0B1020;
+  --bg-secondary: #11182B;
+  --bg-card: #151D32;
+  --bg-elevated: #1B243B;
+  
+  --text-primary: #F5F7FF;
+  --text-secondary: #AAB4CC;
+  --text-muted: #737E98;
+  
+  --accent-primary: #7C5CFF;
+  --accent-secondary: #9B7CFF;
+  --accent-active: #6D5DF5;
+  
+  --status-success: #B8F34A;
+  --status-warning: #F5C451;
+  --status-error: #FF6B6B;
+  
+  --border-subtle: #26304A;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background-color: #0B1020;
+  color: #F5F7FF;
+  font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Subtle background grid pattern for dark surfaces */
+.bg-dark-grid {
+  background-image: radial-gradient(#26304A 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Voice wave animations using purple & live lime accent */
+@keyframes voice-wave {
+  0%, 100% {
+    height: 6px;
+  }
+  50% {
+    height: 32px;
+  }
+}
+
+.animate-voice-bar-1 { animation: voice-wave 1.1s infinite ease-in-out; }
+.animate-voice-bar-2 { animation: voice-wave 0.8s infinite ease-in-out 0.15s; }
+.animate-voice-bar-3 { animation: voice-wave 1.3s infinite ease-in-out 0.3s; }
+.animate-voice-bar-4 { animation: voice-wave 1.0s infinite ease-in-out 0.2s; }
+.animate-voice-bar-5 { animation: voice-wave 1.2s infinite ease-in-out 0.4s; }
+.animate-voice-bar-6 { animation: voice-wave 0.75s infinite ease-in-out 0.25s; }
+.animate-voice-bar-7 { animation: voice-wave 1.4s infinite ease-in-out 0.1s; }
+
+/* Custom Dark Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0B1020;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #26304A;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #7C5CFF;
 }
