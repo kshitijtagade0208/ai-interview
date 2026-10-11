@@ -129,7 +129,7 @@ export default function Home() {
       <footer className="border-t border-[#26304A] bg-[#11182B] py-6 text-center text-xs text-[#737E98]">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <span className="font-mono font-bold text-[#7C5CFF]">InterviewAI</span>
+            <span className="font-mono font-bold text-[#7C5CFF]">SkillBridge</span>
             <span>• Adaptive Neural Technical Interview Platform</span>
           </div>
           <div className="flex items-center gap-3 text-[11px] text-[#737E98] font-medium">

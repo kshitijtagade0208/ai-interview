@@ -71,7 +71,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 Master technical interviews with <span className="text-[#9B7CFF]">Adaptive AI</span>.
               </h1>
               <p className="max-w-2xl text-sm sm:text-base text-[#AAB4CC] leading-relaxed">
-                InterviewAI conducts dynamic, voice-driven mock interviews tailored specifically to your target role and job description. Questions evolve in real-time based on the technical depth and nuance of your answers.
+                SkillBridge conducts dynamic, voice-driven mock interviews tailored specifically to your target role and job description. Questions evolve in real-time based on the technical depth and nuance of your answers.
               </p>
             </div>
 

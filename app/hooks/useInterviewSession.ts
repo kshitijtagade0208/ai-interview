@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import {
   InterviewConfig,
   InterviewSessionState,
@@ -29,7 +29,7 @@ export interface UseInterviewSessionReturn {
   session: InterviewSessionState;
   startInterview: (config: InterviewConfig) => Promise<void>;
   setCurrentQuestion: (question: QuestionData) => void;
-  submitAnswer: (answer: string, notes?: string) => Promise<void>;
+  submitAnswer: (answer: string, notes?: string) => Promise<EvaluationEvidence | null>;
   setEvaluation: (evaluation: InterviewEvaluation) => void;
   advanceToNextQuestion: () => Promise<void>;
   goToPreviousQuestion: () => void;
@@ -65,12 +65,17 @@ const INITIAL_SESSION_STATE: InterviewSessionState = {
 
 export function useInterviewSession(): UseInterviewSessionReturn {
   const [session, setSession] = useState<InterviewSessionState>(INITIAL_SESSION_STATE);
+  const isSubmittingAnswerRef = useRef(false);
+  const isCompletingInterviewRef = useRef(false);
+  const isGeneratingSyllabusRef = useRef(false);
 
   /**
    * Start the interview session by calling /api/interview/generate-syllabus
    * or falling back gracefully to dynamically calibrated questions.
    */
   const startInterview = useCallback(async (config: InterviewConfig) => {
+    if (isGeneratingSyllabusRef.current) return;
+    isGeneratingSyllabusRef.current = true;
     // Immediately build dynamic role-aligned questions so state is clean from millisecond 0
     const immediateInitialQuestions = generateDynamicFallbackQuestions(
       config.targetRole,
@@ -154,6 +159,8 @@ export function useInterviewSession(): UseInterviewSessionReturn {
       if (process.env.NODE_ENV !== 'production') {
         console.warn('[InterviewAI Session] Network/server error during syllabus generation, using dynamic fallback:', err);
       }
+    } finally {
+      isGeneratingSyllabusRef.current = false;
     }
 
     // Fallback: activate the role-calibrated dynamic questions
@@ -200,8 +207,9 @@ export function useInterviewSession(): UseInterviewSessionReturn {
   /**
    * Submit the candidate's answer for real-time evaluation via /api/interview/evaluate-answer.
    */
-  const submitAnswer = useCallback(async (answer: string, notes?: string) => {
-    if (!session.currentQuestion) return;
+  const submitAnswer = useCallback(async (answer: string, notes?: string): Promise<EvaluationEvidence | null> => {
+    if (!session.currentQuestion || isSubmittingAnswerRef.current) return null;
+    isSubmittingAnswerRef.current = true;
 
     const currentQ = session.currentQuestion;
     const timestamp = new Date().toISOString();
@@ -234,18 +242,33 @@ export function useInterviewSession(): UseInterviewSessionReturn {
       };
     });
 
+    // Assemble chronological conversation history for multi-turn conversational context
+    const conversationHistory: Array<{ role: 'interviewer' | 'candidate'; content: string; topic?: string }> = [];
+    session.responses.forEach((r, idx) => {
+      const q = session.questions[idx];
+      if (q) {
+        conversationHistory.push({
+          role: 'interviewer',
+          content: q.conversationalResponse || q.question,
+          topic: q.topic
+        });
+      }
+      conversationHistory.push({ role: 'candidate', content: r.answer, topic: r.skill });
+    });
+
     try {
       const res = await fetch('/api/interview/evaluate-answer', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          question: currentQ.question,
+          question: currentQ.conversationalResponse || currentQ.question,
           candidateAnswer: effectiveAnswer,
           skill: currentQ.topic,
           jobDescription: session.config.jobDescription,
           expectedEvidence: currentQ.expectedKeyPoints,
           currentDifficulty: currentQ.difficulty,
-          questionData: currentQ
+          questionData: currentQ,
+          conversationHistory
         })
       });
 
@@ -261,27 +284,36 @@ export function useInterviewSession(): UseInterviewSessionReturn {
             weaknesses: data.weaknesses || ['Could detail deep failure modes'],
             confidence: typeof data.confidence === 'number' ? data.confidence : 0.92,
             followUpRecommendation: data.reasoning || data.nextQuestion || 'Continue probing',
-            adaptiveDecision: (data.decision as AdaptiveDecision) || 'continue_current_topic'
+            adaptiveDecision: (data.decision as AdaptiveDecision) || 'continue_current_topic',
+            conversationalResponse: data.conversationalResponse
           };
 
           setSession(prev => {
-            // If the adaptive AI formulated a dynamic follow-up, adapt the next question
             const updatedQuestions = [...prev.questions];
             const nextIdx = prev.currentQuestionIndex + 1;
 
-            if (data.nextQuestion && nextIdx < updatedQuestions.length && data.decision !== 'move_to_next_skill') {
-              updatedQuestions[nextIdx] = {
-                ...updatedQuestions[nextIdx],
-                title: `Adaptive Follow-up: ${currentQ.topic}`,
+            if (data.nextQuestion) {
+              const nextQuestionItem: QuestionData = {
+                id: nextIdx < updatedQuestions.length ? updatedQuestions[nextIdx].id : nextIdx + 1,
+                title: `Follow-up: ${currentQ.topic}`,
+                topic: currentQ.topic,
+                difficulty: data.nextDifficulty || currentQ.difficulty,
+                timeLimitSeconds: 300,
                 question: data.nextQuestion,
-                difficulty: data.nextDifficulty || updatedQuestions[nextIdx].difficulty,
-                hints: [`Focus on trade-offs specific to ${currentQ.topic}`, 'Address edge cases and failure modes'],
+                hints: [`Focus on practical trade-offs for ${currentQ.topic}`, 'Address edge cases and failure modes'],
                 expectedKeyPoints: [
-                  `Clear resolution of ${currentQ.topic} edge case`,
-                  'Concrete architectural mechanism',
+                  `Direct resolution of ${currentQ.topic} scenario`,
+                  'Concrete engineering rationale',
                   'Trade-off and reliability considerations'
-                ]
+                ],
+                conversationalResponse: data.conversationalResponse
               };
+
+              if (nextIdx < updatedQuestions.length) {
+                updatedQuestions[nextIdx] = nextQuestionItem;
+              } else {
+                updatedQuestions.push(nextQuestionItem);
+              }
             }
 
             const existingEvIdx = prev.evidences.findIndex(e => e.questionId === currentQ.id);
@@ -291,15 +323,18 @@ export function useInterviewSession(): UseInterviewSessionReturn {
 
             return {
               ...prev,
+              status: 'LIVE',
               questions: updatedQuestions,
               evidences: updatedEvidences
             };
           });
-          return;
+          return newEvidence;
         }
       }
     } catch {
       // Continue with heuristic evaluation fallback
+    } finally {
+      isSubmittingAnswerRef.current = false;
     }
 
     // Heuristic fallback evidence computed from candidate's actual answer and question criteria
@@ -318,26 +353,36 @@ export function useInterviewSession(): UseInterviewSessionReturn {
       weaknesses: fallbackEval.weaknesses,
       confidence: fallbackEval.confidence,
       followUpRecommendation: fallbackEval.reasoning || fallbackEval.nextQuestion,
-      adaptiveDecision: fallbackEval.decision
+      adaptiveDecision: fallbackEval.decision,
+      conversationalResponse: fallbackEval.conversationalResponse
     };
 
     setSession(prev => {
       const updatedQuestions = [...prev.questions];
       const nextIdx = prev.currentQuestionIndex + 1;
 
-      if (fallbackEval.nextQuestion && nextIdx < updatedQuestions.length && fallbackEval.decision !== 'move_to_next_skill') {
-        updatedQuestions[nextIdx] = {
-          ...updatedQuestions[nextIdx],
-          title: `Adaptive Follow-up: ${currentQ.topic}`,
+      if (fallbackEval.nextQuestion) {
+        const nextQuestionItem: QuestionData = {
+          id: nextIdx < updatedQuestions.length ? updatedQuestions[nextIdx].id : nextIdx + 1,
+          title: `Follow-up: ${currentQ.topic}`,
+          topic: currentQ.topic,
+          difficulty: fallbackEval.nextDifficulty || currentQ.difficulty,
+          timeLimitSeconds: 300,
           question: fallbackEval.nextQuestion,
-          difficulty: fallbackEval.nextDifficulty || updatedQuestions[nextIdx].difficulty,
           hints: [`Focus on trade-offs specific to ${currentQ.topic}`, 'Address edge cases and failure modes'],
           expectedKeyPoints: [
             `Clear resolution of ${currentQ.topic} edge case`,
             'Concrete architectural mechanism',
             'Trade-off and reliability considerations'
-          ]
+          ],
+          conversationalResponse: fallbackEval.conversationalResponse
         };
+
+        if (nextIdx < updatedQuestions.length) {
+          updatedQuestions[nextIdx] = nextQuestionItem;
+        } else {
+          updatedQuestions.push(nextQuestionItem);
+        }
       }
 
       const existingEvIdx = prev.evidences.findIndex(e => e.questionId === currentQ.id);
@@ -346,16 +391,21 @@ export function useInterviewSession(): UseInterviewSessionReturn {
         : [...prev.evidences, fallbackEvidence];
       return {
         ...prev,
+        status: 'LIVE',
         questions: updatedQuestions,
         evidences: updatedEvidences
       };
     });
-  }, [session.currentQuestion, session.config.jobDescription]);
+    return fallbackEvidence;
+  }, [session.currentQuestion, session.config.jobDescription, session.responses, session.questions]);
 
   /**
    * Finalize the interview session and generate the comprehensive assessment report via /api/interview/generate-report.
    */
   const completeInterview = useCallback(async () => {
+    if (isCompletingInterviewRef.current) return;
+    isCompletingInterviewRef.current = true;
+
     setSession(prev => ({
       ...prev,
       status: 'EVALUATING'
@@ -392,6 +442,8 @@ export function useInterviewSession(): UseInterviewSessionReturn {
       }
     } catch {
       // Fallback synthesis
+    } finally {
+      isCompletingInterviewRef.current = false;
     }
 
     const questionScores = session.responses.map(r => {
@@ -484,22 +536,22 @@ export function useInterviewSession(): UseInterviewSessionReturn {
    * Advance to the next question or complete the interview if on final question.
    */
   const advanceToNextQuestion = useCallback(async () => {
-    const nextIndex = session.currentQuestionIndex + 1;
-
-    if (nextIndex < session.questions.length) {
-      const nextQ = session.questions[nextIndex];
-      setSession(prev => ({
-        ...prev,
-        status: 'LIVE',
-        currentQuestionIndex: nextIndex,
-        currentQuestion: nextQ,
-        currentSkill: nextQ.topic,
-        currentDifficulty: nextQ.difficulty
-      }));
-    } else {
-      await completeInterview();
-    }
-  }, [session.currentQuestionIndex, session.questions, completeInterview]);
+    setSession(prev => {
+      const nextIndex = prev.currentQuestionIndex + 1;
+      if (nextIndex < prev.questions.length) {
+        const nextQ = prev.questions[nextIndex];
+        return {
+          ...prev,
+          status: 'LIVE',
+          currentQuestionIndex: nextIndex,
+          currentQuestion: nextQ,
+          currentSkill: nextQ.topic,
+          currentDifficulty: nextQ.difficulty
+        };
+      }
+      return prev;
+    });
+  }, []);
 
   /**
    * Navigate back to the previous question without losing session progress.

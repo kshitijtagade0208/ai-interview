@@ -38,10 +38,10 @@ export const Navbar: React.FC<NavbarProps> = ({
           <div className="flex flex-col">
             <div className="flex items-center gap-2">
               <span className="text-lg font-bold tracking-tight text-[#F5F7FF] font-mono">
-                Interview<span className="text-[#7C5CFF]">AI</span>
+                Skill<span className="text-[#7C5CFF]">Bridge</span>
               </span>
               <span className="rounded-md bg-[#1B243B] px-2 py-0.5 text-[10px] font-bold text-[#9B7CFF] border border-[#26304A] uppercase tracking-wider">
-                PRO
+                AI
               </span>
             </div>
             <span className="text-[10px] text-[#737E98] hidden sm:inline font-medium">

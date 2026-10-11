@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "InterviewAI — Adaptive Technical Interview Platform",
+  title: "SkillBridge — Adaptive Technical Interview Platform",
   description: "AI-powered adaptive technical interviewer that conducts real-time voice and video mock interviews dynamically tuned to your target role and job description.",
 };
 

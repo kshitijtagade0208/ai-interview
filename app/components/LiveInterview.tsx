@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Mic,
   MicOff,
@@ -11,23 +11,18 @@ import {
   Clock,
   ShieldCheck,
   Volume2,
-  VolumeX,
-  Share2,
   ChevronRight,
   ChevronLeft,
   Lightbulb,
   MessageSquare,
   Code2,
   FileText,
-  Activity,
   Bot,
   User,
   Cpu,
   AlertCircle,
   Square,
-  Play,
-  RotateCcw,
-  CheckCircle2
+  RotateCcw
 } from 'lucide-react';
 import { QuestionData, InterviewConfig } from '../types/interview';
 import {
@@ -35,12 +30,12 @@ import {
   generateDynamicFallbackQuestions
 } from '../data/mockData';
 import { useVoiceInterview } from '../hooks/useVoiceInterview';
-import { composeFinalAnswer } from '../lib/evaluation/scoring';
+import { useLiveKitRoom } from '../hooks/useLiveKitRoom';
+import { composeFinalAnswer, appendSpeechText, getUncommittedInterim } from '../lib/evaluation/scoring';
 
 interface LiveInterviewProps {
   config: InterviewConfig;
   onEndInterview: () => void;
-  // Session state hooks integration
   currentQuestionData?: QuestionData;
   questionIndex?: number;
   totalQuestionsCount?: number;
@@ -63,7 +58,6 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
   const activeQuestionIndex = questionIndex !== undefined ? questionIndex : internalQuestionIndex;
   const totalQuestions = totalQuestionsCount || MOCK_INTERVIEW_QUESTIONS.length;
 
-  const [isSpeakerOn, setIsSpeakerOn] = useState(true);
   const [isCaptionsOn, setIsCaptionsOn] = useState(true);
   const [activeTab, setActiveTab] = useState<'question' | 'scratchpad' | 'hints'>('question');
   
@@ -73,38 +67,105 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
 
   const [showEndModal, setShowEndModal] = useState(false);
   const [validationWarning, setValidationWarning] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const isSubmittingRef = useRef(false);
+  const isAutoAdvancingRef = useRef(false);
+  const [latestInterviewerSpokenTurn, setLatestInterviewerSpokenTurn] = useState<string | null>(null);
+  const [isFinishingTurn, setIsFinishingTurn] = useState(false);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const hasSpokenInCurrentTurnRef = useRef<boolean>(false);
+
+  // Sync state refs to prevent stale closure bugs in asynchronous timeouts
+  const currentScratchpadRef = useRef(currentScratchpad);
+  useEffect(() => {
+    currentScratchpadRef.current = currentScratchpad;
+  }, [currentScratchpad]);
+
+  const transcriptRef = useRef('');
+  const interimTranscriptRef = useRef('');
+  const isListeningRef = useRef(false);
+  const isSpeakingQuestionRef = useRef(false);
+
+  // Real-time speech-to-text chunk handler appending speech directly into active scratchpad
+  const handleFinalTranscript = useCallback((chunk: string) => {
+    if (!chunk || !chunk.trim()) return;
+    const textToAppend = chunk.trim();
+    hasSpokenInCurrentTurnRef.current = true;
+    setScratchpads(prev => {
+      const existing = (prev[activeQuestionIndex] || '').trim();
+      const updated = appendSpeechText(existing, textToAppend);
+      return {
+        ...prev,
+        [activeQuestionIndex]: updated
+      };
+    });
+  }, [activeQuestionIndex]);
 
   // Hook for Web Speech STT, TTS, and local Camera stream
   const {
     micState,
     micError,
     isListening,
+    isMuted,
     transcript,
     interimTranscript,
-    isSpeechRecognitionSupported,
     startSpeaking,
     stopSpeaking,
-    setTranscript,
+    pauseListening,
+    resumeListening,
+    mute,
+    unmute,
     clearTranscript,
 
-    isSpeechSynthesisSupported,
     isSpeakingQuestion,
     playQuestionAudio,
     stopQuestionAudio,
 
     cameraState,
-    cameraError,
     videoRef,
     enableCamera,
-    disableCamera,
     toggleCamera,
 
     cleanupMedia
-  } = useVoiceInterview();
+  } = useVoiceInterview({
+    onFinalTranscript: handleFinalTranscript
+  });
+
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+
+  useEffect(() => {
+    interimTranscriptRef.current = interimTranscript;
+  }, [interimTranscript]);
+
+  useEffect(() => {
+    isListeningRef.current = isListening;
+  }, [isListening]);
+
+  useEffect(() => {
+    isSpeakingQuestionRef.current = isSpeakingQuestion;
+  }, [isSpeakingQuestion]);
+
+  const displayInterim = getUncommittedInterim(currentScratchpad, interimTranscript);
+
+  // LiveKit Real-time WebRTC Room Connection
+  const safeRoleSlug = (config.targetRole || 'general').toLowerCase().replace(/[^a-z0-9]/g, '-');
+  const {
+    isConnected: isLiveKitConnected,
+    isConnecting: isLiveKitConnecting,
+    isAgentSpeaking: isLiveKitAgentSpeaking,
+    participantCount: livekitParticipants,
+    setMicrophoneEnabled: setLiveKitMicEnabled,
+    connectToRoom: reconnectLiveKit
+  } = useLiveKitRoom({
+    roomName: `skillbridge-${safeRoleSlug}`,
+    candidateName: 'Candidate',
+    autoConnect: true,
+  });
 
   // Dynamic AI state indicator
-  const aiState: 'speaking' | 'listening' | 'evaluating' = 
-    isSpeakingQuestion ? 'speaking' : isListening ? 'listening' : 'speaking';
+  const isAgentSpeaking = isSpeakingQuestion || isLiveKitAgentSpeaking;
 
   // Timer countdown
   const [secondsRemaining, setSecondsRemaining] = useState(config.duration * 60);
@@ -116,34 +177,39 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
     return () => clearInterval(timer);
   }, []);
 
-  // Sync speech recognition transcript into current question's answer scratchpad
-  useEffect(() => {
-    if (transcript) {
-      setScratchpads(prev => {
-        const existing = prev[activeQuestionIndex] || '';
-        // If scratchpad doesn't already contain the transcript text, append or update it
-        if (!existing.includes(transcript)) {
-          const updated = existing ? `${existing.trim()}\n${transcript}` : transcript;
-          return {
-            ...prev,
-            [activeQuestionIndex]: updated
-          };
-        }
-        return prev;
-      });
-      // Clear hook buffer once transferred
-      clearTranscript();
+  // Synchronize mute/unmute action across both Web Speech API and LiveKit audio track
+  const handleToggleMute = useCallback(() => {
+    if (isMuted || micState === 'muted') {
+      unmute();
+      if (setLiveKitMicEnabled) {
+        setLiveKitMicEnabled(true);
+      }
+    } else if (isListening) {
+      mute();
+      if (setLiveKitMicEnabled) {
+        setLiveKitMicEnabled(false);
+      }
+    } else {
+      startSpeaking();
+      if (setLiveKitMicEnabled) {
+        setLiveKitMicEnabled(true);
+      }
     }
-  }, [transcript, activeQuestionIndex, clearTranscript]);
+  }, [isMuted, micState, isListening, mute, unmute, startSpeaking, setLiveKitMicEnabled]);
 
-  // Stop active speech when question changes
+  // Stop active speech and audio ONLY when question actually changes
+  const prevQuestionIndexRef = useRef(activeQuestionIndex);
   useEffect(() => {
-    stopQuestionAudio();
-    if (isListening) {
-      stopSpeaking();
+    if (prevQuestionIndexRef.current !== activeQuestionIndex) {
+      prevQuestionIndexRef.current = activeQuestionIndex;
+      if (!isAutoAdvancingRef.current) {
+        stopQuestionAudio();
+      }
+      isAutoAdvancingRef.current = false;
+      clearTranscript();
+      setValidationWarning(null);
     }
-    setValidationWarning(null);
-  }, [activeQuestionIndex, stopQuestionAudio, isListening, stopSpeaking]);
+  }, [activeQuestionIndex, stopQuestionAudio, clearTranscript]);
 
   const formatTimer = (totalSecs: number) => {
     const mins = Math.floor(totalSecs / 60);
@@ -165,29 +231,45 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
     MOCK_INTERVIEW_QUESTIONS[activeQuestionIndex] ||
     MOCK_INTERVIEW_QUESTIONS[0];
 
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  // Derived active interviewer spoken turn (prefers latest turn from evaluation, falls back to question metadata)
+  const activeInterviewerSpokenTurn = latestInterviewerSpokenTurn || currentQuestion?.conversationalResponse || null;
 
-  const handleNextQuestion = () => {
-    if (isSubmitting) return;
+  const handleNextQuestion = useCallback(async () => {
+    if (isSubmittingRef.current) return;
+
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    setIsFinishingTurn(false);
 
     // Compose final candidate answer across typed scratchpad, final transcript, and interim speech
-    const candidateAnswer = composeFinalAnswer(currentScratchpad, transcript, interimTranscript);
+    const candidateAnswer = composeFinalAnswer(
+      currentScratchpadRef.current,
+      transcriptRef.current,
+      interimTranscriptRef.current
+    );
 
-    // Stop active audio and speech capture
+    const wasListening = isListeningRef.current && !isMuted;
+
+    // Stop active audio narration and pause speech capture to avoid transcribing background noise
     stopQuestionAudio();
-    if (isListening) {
-      stopSpeaking();
+    if (wasListening) {
+      pauseListening();
     }
     clearTranscript();
 
     // Guard against submitting an empty answer if in voice mode without any spoken content
-    if (!candidateAnswer && isListening) {
-      setValidationWarning('Please stop speaking or finish transcribing your answer before submitting.');
+    if (!candidateAnswer.trim() && wasListening) {
+      setValidationWarning('Please speak or type your answer before submitting.');
+      resumeListening();
       return;
     }
 
+    isSubmittingRef.current = true;
     setIsSubmitting(true);
     setValidationWarning(null);
+    hasSpokenInCurrentTurnRef.current = false;
 
     // Update scratchpad for current question with the final composed answer
     setScratchpads(prev => ({
@@ -196,25 +278,111 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
     }));
 
     // Submit answer through existing evaluation pipeline
-    if (onSubmitAnswer) {
-      const effectiveResponse = candidateAnswer || 'Candidate presented verbal response.';
-      onSubmitAnswer(effectiveResponse, candidateAnswer || undefined);
+    let evaluationResult: any = null;
+    try {
+      if (onSubmitAnswer) {
+        const effectiveResponse = candidateAnswer || 'Candidate presented verbal response.';
+        evaluationResult = await onSubmitAnswer(effectiveResponse, candidateAnswer || undefined);
+      }
+    } catch (err) {
+      console.error('[LiveInterview] Error evaluating answer:', err);
     }
 
     if (activeQuestionIndex < totalQuestions - 1) {
+      isAutoAdvancingRef.current = true;
       if (onAdvanceQuestion) {
         onAdvanceQuestion();
       } else {
         setInternalQuestionIndex(prev => prev + 1);
       }
+      isSubmittingRef.current = false;
       setIsSubmitting(false);
+
+      // Conversational Voice: Dr. Maya speaks her personalized follow-up turn aloud
+      const spokenTurn = evaluationResult?.conversationalResponse;
+      if (spokenTurn) {
+        setLatestInterviewerSpokenTurn(spokenTurn);
+        setTimeout(() => {
+          playQuestionAudio(spokenTurn);
+        }, 300);
+      } else if (wasListening) {
+        setTimeout(() => {
+          resumeListening();
+        }, 300);
+      }
     } else {
       setShowEndModal(true);
+      isSubmittingRef.current = false;
       setIsSubmitting(false);
     }
-  };
+  }, [
+    activeQuestionIndex,
+    totalQuestions,
+    isMuted,
+    onSubmitAnswer,
+    onAdvanceQuestion,
+    stopQuestionAudio,
+    pauseListening,
+    resumeListening,
+    clearTranscript,
+    playQuestionAudio
+  ]);
 
-  const handlePrevQuestion = () => {
+  // Turn-Taking Engine: Detect natural pause in candidate speech and auto-trigger AI turn
+  useEffect(() => {
+    if (!isListening || isSpeakingQuestion || isSubmitting) {
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
+      if (isFinishingTurn) {
+        setIsFinishingTurn(false);
+      }
+      return;
+    }
+
+    const hasSpeechText = Boolean(interimTranscript.trim() || transcript.trim());
+    if (hasSpeechText) {
+      hasSpokenInCurrentTurnRef.current = true;
+    }
+
+    if (hasSpokenInCurrentTurnRef.current) {
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+      }
+
+      const finishNoticeTimer = setTimeout(() => {
+        setIsFinishingTurn(true);
+      }, 1200);
+
+      silenceTimerRef.current = setTimeout(() => {
+        setIsFinishingTurn(false);
+        const composedAnswer = composeFinalAnswer(
+          currentScratchpadRef.current,
+          transcriptRef.current,
+          interimTranscriptRef.current
+        ).trim();
+
+        if (
+          hasSpokenInCurrentTurnRef.current &&
+          composedAnswer.length >= 2 &&
+          !isSubmittingRef.current &&
+          !isSpeakingQuestionRef.current
+        ) {
+          handleNextQuestion();
+        }
+      }, 2000);
+
+      return () => {
+        clearTimeout(finishNoticeTimer);
+        if (silenceTimerRef.current) {
+          clearTimeout(silenceTimerRef.current);
+        }
+      };
+    }
+  }, [interimTranscript, transcript, isListening, isSpeakingQuestion, isSubmitting, handleNextQuestion]);
+
+  const handlePrevQuestion = useCallback(() => {
     stopQuestionAudio();
     if (isListening) {
       stopSpeaking();
@@ -224,29 +392,26 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
     } else if (activeQuestionIndex > 0) {
       setInternalQuestionIndex(prev => prev - 1);
     }
-  };
+  }, [activeQuestionIndex, onPreviousQuestion, stopQuestionAudio, stopSpeaking, isListening]);
 
-  const handleTogglePlayQuestion = () => {
+  const handleTogglePlayQuestion = useCallback(() => {
     if (isSpeakingQuestion) {
       stopQuestionAudio();
     } else {
-      playQuestionAudio(`${currentQuestion.title}. ${currentQuestion.question}`);
+      const textToPlay = activeInterviewerSpokenTurn || `${currentQuestion.title}. ${currentQuestion.question}`;
+      playQuestionAudio(textToPlay);
     }
-  };
+  }, [isSpeakingQuestion, activeInterviewerSpokenTurn, currentQuestion, stopQuestionAudio, playQuestionAudio]);
 
-  const handleEndCallConfirmed = () => {
+  const handleEndCallConfirmed = useCallback(() => {
     cleanupMedia();
-    const candidateAnswer = composeFinalAnswer(currentScratchpad, transcript, interimTranscript);
-    if (onSubmitAnswer && candidateAnswer) {
-      onSubmitAnswer(candidateAnswer, candidateAnswer);
-    }
     setShowEndModal(false);
     onEndInterview();
-  };
+  }, [cleanupMedia, onEndInterview]);
 
   return (
-    <div className="mx-auto max-w-7xl space-y-4 pb-12">
-      {/* Top Session Bar */}
+    <div className="space-y-6 pb-16">
+      {/* Top Status & Controls Header */}
       <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-[#26304A] bg-[#151D32] px-4 py-3 shadow-lg">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 rounded-lg bg-[#B8F34A]/10 border border-[#B8F34A]/30 px-3 py-1">
@@ -279,18 +444,38 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
           </div>
 
           <div className="hidden md:flex items-center gap-2 text-xs text-[#AAB4CC]">
-            <span>Round Progress:</span>
+            <span>Progress:</span>
             <span className="font-mono font-bold text-[#9B7CFF]">
               Q{activeQuestionIndex + 1} of {totalQuestions}
             </span>
           </div>
         </div>
 
-        {/* Security / Media Status & End Button */}
+        {/* LiveKit / Security / Media Status & End Button */}
         <div className="flex items-center gap-3">
+          {isLiveKitConnected ? (
+            <div className="hidden sm:flex items-center gap-1.5 text-[11px] font-semibold text-[#B8F34A] bg-[#11182B] border border-[#B8F34A]/30 px-2.5 py-1 rounded-lg shadow-sm">
+              <span className="h-2 w-2 rounded-full bg-[#B8F34A] animate-pulse" />
+              <span>LiveKit RAG WebRTC: Active ({livekitParticipants} connected)</span>
+            </div>
+          ) : isLiveKitConnecting ? (
+            <div className="hidden sm:flex items-center gap-1.5 text-[11px] font-semibold text-[#9B7CFF] bg-[#11182B] border border-[#7C5CFF]/30 px-2.5 py-1 rounded-lg shadow-sm">
+              <span className="h-2 w-2 rounded-full bg-[#9B7CFF] animate-ping" />
+              <span>Connecting to LiveKit Cloud...</span>
+            </div>
+          ) : (
+            <button
+              onClick={reconnectLiveKit}
+              className="hidden sm:flex items-center gap-1.5 text-[11px] font-semibold text-[#AAB4CC] hover:text-[#F5F7FF] bg-[#11182B] border border-[#26304A] px-2.5 py-1 rounded-lg transition-colors"
+            >
+              <span className="h-2 w-2 rounded-full bg-[#737E98]" />
+              <span>LiveKit: Connect</span>
+            </button>
+          )}
+
           <div className="hidden lg:flex items-center gap-1.5 text-[11px] font-medium text-[#AAB4CC] bg-[#11182B] border border-[#26304A] px-2.5 py-1 rounded-lg">
             <ShieldCheck className="h-3.5 w-3.5 text-[#B8F34A]" />
-            <span>Encrypted • Local Audio & Video</span>
+            <span>Low-Latency Pipeline</span>
           </div>
 
           <button
@@ -303,13 +488,12 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
         </div>
       </div>
 
-      {/* Main Grid: Left Feeds (AI Avatar & Candidate Camera) + Right Workspace (Question & Voice Input) */}
+      {/* Main Grid: Left Feeds (AI Avatar & Candidate Camera) + Right Workspace */}
       <div className="grid gap-4 lg:grid-cols-12">
         {/* Left Column: AI Avatar Feed & Candidate Camera Feed (5 cols) */}
         <div className="space-y-4 lg:col-span-5 flex flex-col">
           {/* AI Interviewer Video Avatar Feed */}
           <div className="relative overflow-hidden rounded-2xl border border-[#26304A] bg-[#11182B] p-4 shadow-xl min-h-[250px] flex flex-col justify-between text-[#F5F7FF]">
-            {/* Subtle Grid */}
             <div className="pointer-events-none absolute inset-0 bg-dark-grid opacity-20" />
 
             {/* Top Bar inside AI Feed */}
@@ -324,7 +508,11 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                 <span className={`h-2 w-2 rounded-full ${isSpeakingQuestion ? 'bg-[#B8F34A] animate-ping' : isListening ? 'bg-[#7C5CFF] animate-pulse' : 'bg-[#B8F34A]'}`} />
                 <span className="capitalize">
                   {isSpeakingQuestion
-                    ? 'Speaking Question'
+                    ? 'Speaking Follow-Up'
+                    : isSubmitting
+                    ? 'Dr. Maya is Thinking...'
+                    : isFinishingTurn
+                    ? 'Finishing Turn...'
                     : isListening
                     ? 'Listening to Candidate...'
                     : 'Adaptive Engine Ready'}
@@ -340,13 +528,13 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                     ? 'border-[#B8F34A] bg-[#1B243B] shadow-[#B8F34A]/20 scale-105'
                     : 'border-[#7C5CFF]/40 bg-[#1B243B] shadow-[#7C5CFF]/10'
                 }`}>
-                  <Sparkles className={`h-8 w-8 transition-colors ${isSpeakingQuestion ? 'text-[#B8F34A]' : 'text-[#9B7CFF]'}`} />
+                  <Sparkles className={`h-8 w-8 transition-colors ${isAgentSpeaking ? 'text-[#B8F34A]' : 'text-[#9B7CFF]'}`} />
                 </div>
               </div>
 
               {/* Dynamic Animated Voice Wave Bars */}
               <div className="mt-3 flex items-center justify-center gap-1.5 h-8">
-                {isSpeakingQuestion ? (
+                {isAgentSpeaking ? (
                   <>
                     <span className="w-1.5 rounded-full bg-[#7C5CFF] animate-voice-bar-1" />
                     <span className="w-1.5 rounded-full bg-[#9B7CFF] animate-voice-bar-2" />
@@ -356,6 +544,16 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                     <span className="w-1.5 rounded-full bg-[#B8F34A] animate-voice-bar-6" />
                     <span className="w-1.5 rounded-full bg-[#7C5CFF] animate-voice-bar-7" />
                   </>
+                ) : isSubmitting ? (
+                  <div className="flex items-center gap-2 text-xs text-[#9B7CFF] font-medium bg-[#1B243B] px-3 py-1 rounded-lg border border-[#7C5CFF]/30">
+                    <div className="h-2.5 w-2.5 rounded-full border-2 border-[#9B7CFF] border-t-transparent animate-spin" />
+                    <span>Dr. Maya is evaluating and preparing response...</span>
+                  </div>
+                ) : isFinishingTurn ? (
+                  <div className="flex items-center gap-2 text-xs text-[#B8F34A] font-medium bg-[#1B243B] px-3 py-1 rounded-lg border border-[#B8F34A]/30">
+                    <span className="h-2 w-2 rounded-full bg-[#B8F34A] animate-pulse" />
+                    <span>Processing response pause...</span>
+                  </div>
                 ) : isListening ? (
                   <div className="flex items-center gap-2 text-xs text-[#9B7CFF] font-medium bg-[#1B243B] px-3 py-1 rounded-lg border border-[#7C5CFF]/30">
                     <span className="h-2 w-2 rounded-full bg-[#7C5CFF] animate-ping" />
@@ -367,13 +565,35 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                   </div>
                 )}
               </div>
+
+              {/* Spoken Follow-Up Context from Dr. Maya */}
+              {activeInterviewerSpokenTurn && (
+                <div className="mt-3 w-full rounded-xl border border-[#7C5CFF]/30 bg-[#0B1020]/90 p-2.5 backdrop-blur-sm text-left">
+                  <div className="flex items-center justify-between text-[10px] font-bold text-[#9B7CFF] mb-1">
+                    <span className="flex items-center gap-1">
+                      <Sparkles className="h-3 w-3 text-[#B8F34A]" />
+                      Dr. Maya&apos;s Follow-Up
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => playQuestionAudio(activeInterviewerSpokenTurn)}
+                      className="text-[#B8F34A] hover:underline flex items-center gap-1 text-[10px]"
+                    >
+                      <Volume2 className="h-3 w-3" /> Replay
+                    </button>
+                  </div>
+                  <p className="text-xs text-[#E2E8F0] italic leading-relaxed line-clamp-3">
+                    &ldquo;{activeInterviewerSpokenTurn}&rdquo;
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Bottom Controls inside AI Feed */}
             <div className="relative z-10 flex items-center justify-between text-[11px] text-[#AAB4CC] border-t border-[#26304A] pt-2">
               <div className="flex items-center gap-1.5">
                 <Cpu className="h-3 w-3 text-[#7C5CFF]" />
-                <span>Web Speech AI Voice Synthesis</span>
+                <span>AI Voice Synthesis</span>
               </div>
               <button
                 onClick={handleTogglePlayQuestion}
@@ -389,7 +609,7 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
             </div>
           </div>
 
-          {/* Candidate Camera Stream (Local WebRTC / MediaStream) */}
+          {/* Candidate Camera Stream & Audio Controls */}
           <div className="relative overflow-hidden rounded-2xl border border-[#26304A] bg-[#151D32] p-4 shadow-sm min-h-[220px] flex flex-col justify-between">
             {/* Top Bar inside Candidate Feed */}
             <div className="relative z-10 flex items-center justify-between">
@@ -398,12 +618,40 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                 <span className="text-xs font-bold text-[#F5F7FF]">Candidate Feed</span>
               </div>
 
-              {/* Camera State Badge */}
-              <div className="flex items-center gap-1.5">
+              {/* Status Badges: Mic & Camera */}
+              <div className="flex items-center gap-2">
+                {/* Dynamic Mic Status Badge */}
+                {isMuted ? (
+                  <span className="flex items-center gap-1 rounded-lg bg-[#FF6B6B]/10 border border-[#FF6B6B]/30 px-2 py-0.5 text-[10px] font-bold text-[#FF6B6B]">
+                    <MicOff className="h-3 w-3" />
+                    <span>Muted</span>
+                  </span>
+                ) : isListening ? (
+                  <span className="flex items-center gap-1 rounded-lg bg-[#B8F34A]/10 border border-[#B8F34A]/30 px-2 py-0.5 text-[10px] font-bold text-[#B8F34A]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[#B8F34A] animate-pulse" />
+                    <span>Mic Live</span>
+                  </span>
+                ) : micState === 'requesting' ? (
+                  <span className="flex items-center gap-1 rounded-lg bg-[#7C5CFF]/10 border border-[#7C5CFF]/30 px-2 py-0.5 text-[10px] font-bold text-[#9B7CFF]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[#9B7CFF] animate-pulse" />
+                    <span>Connecting...</span>
+                  </span>
+                ) : micState === 'error' ? (
+                  <span className="flex items-center gap-1 rounded-lg bg-[#F5C451]/10 border border-[#F5C451]/30 px-2 py-0.5 text-[10px] font-bold text-[#F5C451]">
+                    <AlertCircle className="h-3 w-3" />
+                    <span>Mic Error</span>
+                  </span>
+                ) : (
+                  <span className="rounded-lg bg-[#1B243B] border border-[#26304A] px-2 py-0.5 text-[10px] font-bold text-[#737E98]">
+                    Mic Idle
+                  </span>
+                )}
+
+                {/* Camera Status Badge */}
                 {cameraState === 'active' ? (
                   <span className="flex items-center gap-1 rounded-lg bg-[#B8F34A]/10 border border-[#B8F34A]/30 px-2 py-0.5 text-[10px] font-bold text-[#B8F34A]">
                     <span className="h-1.5 w-1.5 rounded-full bg-[#B8F34A]" />
-                    <span>Camera Live (Local)</span>
+                    <span>Camera Live</span>
                   </span>
                 ) : cameraState === 'denied' ? (
                   <span className="rounded-lg bg-[#F5C451]/10 border border-[#F5C451]/30 px-2 py-0.5 text-[10px] font-bold text-[#F5C451]">
@@ -453,15 +701,63 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
               )}
             </div>
 
-            {/* Privacy Telemetry Note */}
-            <div className="relative z-10 flex items-center justify-between text-[10px] text-[#737E98] border-t border-[#26304A] pt-2">
-              <span>Local stream only • No video transmitted or recorded</span>
-              <button
-                onClick={toggleCamera}
-                className="text-[#9B7CFF] hover:underline font-bold text-[11px]"
-              >
-                {cameraState === 'active' ? 'Turn Off' : 'Turn On'}
-              </button>
+            {/* Candidate Controls: Mute/Unmute Mic & Turn On/Off Camera */}
+            <div className="relative z-10 flex flex-wrap items-center justify-between gap-2 border-t border-[#26304A] pt-2">
+              <div className="flex items-center gap-2">
+                {/* Dedicated Microphone Mute / Unmute / Start Button */}
+                <button
+                  onClick={handleToggleMute}
+                  aria-label={isMuted ? 'Unmute microphone' : isListening ? 'Mute microphone' : 'Start microphone'}
+                  aria-pressed={isListening}
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-bold transition-all shadow-sm ${
+                    isMuted
+                      ? 'bg-[#FF6B6B]/20 border-[#FF6B6B]/40 text-[#FF6B6B] hover:bg-[#FF6B6B]/30'
+                      : isListening
+                      ? 'bg-[#B8F34A]/20 border-[#B8F34A]/40 text-[#B8F34A] hover:bg-[#B8F34A]/30'
+                      : micState === 'error'
+                      ? 'bg-[#F5C451]/20 border-[#F5C451]/40 text-[#F5C451] hover:bg-[#F5C451]/30'
+                      : 'bg-[#1B243B] border-[#26304A] text-[#AAB4CC] hover:text-[#F5F7FF]'
+                  }`}
+                >
+                  {isMuted ? (
+                    <MicOff className="h-3.5 w-3.5" />
+                  ) : isListening ? (
+                    <Mic className="h-3.5 w-3.5" />
+                  ) : micState === 'error' ? (
+                    <RotateCcw className="h-3.5 w-3.5 text-[#F5C451]" />
+                  ) : (
+                    <Mic className="h-3.5 w-3.5" />
+                  )}
+                  <span>
+                    {isMuted
+                      ? 'Unmute Mic'
+                      : isListening
+                      ? 'Mute Mic'
+                      : micState === 'error'
+                      ? 'Retry Mic'
+                      : micState === 'requesting'
+                      ? 'Connecting...'
+                      : 'Start Mic'}
+                  </span>
+                </button>
+
+                {/* Camera Toggle Button */}
+                <button
+                  onClick={toggleCamera}
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-bold transition-all ${
+                    cameraState === 'active'
+                      ? 'bg-[#1B243B] border-[#26304A] text-[#F5F7FF] hover:bg-[#26304A]'
+                      : 'bg-[#7C5CFF]/20 border-[#7C5CFF]/40 text-[#9B7CFF] hover:bg-[#7C5CFF]/30'
+                  }`}
+                >
+                  {cameraState === 'active' ? <VideoOff className="h-3.5 w-3.5" /> : <Video className="h-3.5 w-3.5" />}
+                  <span>{cameraState === 'active' ? 'Turn Off Cam' : 'Turn On Cam'}</span>
+                </button>
+              </div>
+
+              <span className="text-[10px] text-[#737E98] hidden sm:inline">
+                Local stream • Private
+              </span>
             </div>
           </div>
         </div>
@@ -527,6 +823,32 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
             {/* Tab 1: Question Scenario */}
             {activeTab === 'question' && (
               <div className="space-y-4">
+                {/* Natural Conversational Follow-Up Banner */}
+                {activeInterviewerSpokenTurn && (
+                  <div className="rounded-xl border border-[#7C5CFF]/40 bg-[#1B243B]/90 p-3.5 flex items-start gap-3 shadow-md">
+                    <div className="p-1.5 rounded-lg bg-[#7C5CFF]/20 text-[#9B7CFF] shrink-0 mt-0.5">
+                      <Bot className="h-4 w-4" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-bold uppercase tracking-wider text-[#9B7CFF]">
+                          Dr. Maya&apos;s Follow-Up &amp; Evaluation Context
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => playQuestionAudio(activeInterviewerSpokenTurn)}
+                          className="text-xs text-[#B8F34A] hover:underline flex items-center gap-1 font-semibold shrink-0"
+                        >
+                          <Volume2 className="h-3.5 w-3.5" /> Listen
+                        </button>
+                      </div>
+                      <p className="text-xs sm:text-sm text-[#F5F7FF] mt-1.5 leading-relaxed italic">
+                        &ldquo;{activeInterviewerSpokenTurn}&rdquo;
+                      </p>
+                    </div>
+                  </div>
+                )}
+
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <h2 className="text-base sm:text-lg font-bold text-[#F5F7FF] leading-snug">
@@ -561,13 +883,52 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                 {/* Voice Input Quickbar inside Question View */}
                 <div className="rounded-xl border border-[#26304A] bg-[#11182B] p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
                   <div className="flex items-center gap-2">
-                    <span className={`flex h-3 w-3 rounded-full ${isListening ? 'bg-[#FF6B6B] animate-ping' : 'bg-[#B8F34A]'}`} />
+                    <span
+                      className={`flex h-3 w-3 rounded-full ${
+                        isMuted
+                          ? 'bg-[#FF6B6B]'
+                          : isListening
+                          ? 'bg-[#B8F34A] animate-ping'
+                          : micState === 'requesting'
+                          ? 'bg-[#9B7CFF] animate-pulse'
+                          : micState === 'error'
+                          ? 'bg-[#F5C451]'
+                          : 'bg-[#7C5CFF]'
+                      }`}
+                    />
                     <span className="text-xs font-bold text-[#F5F7FF]">
-                      {isListening ? 'Microphone Active — Speaking live...' : 'Voice Answer Ready'}
+                      {isMuted
+                        ? 'Microphone Muted'
+                        : isSubmitting
+                        ? 'Dr. Maya is Thinking...'
+                        : isFinishingTurn
+                        ? 'Pause Detected — Finishing Turn...'
+                        : isListening
+                        ? 'Microphone Active — Speaking live...'
+                        : micState === 'requesting'
+                        ? 'Requesting Microphone Access...'
+                        : micState === 'error'
+                        ? 'Microphone Error'
+                        : 'Microphone Ready'}
                     </span>
                   </div>
 
                   <div className="flex items-center gap-2">
+                    {/* Mute/Unmute Toggle in Quickbar */}
+                    <button
+                      onClick={handleToggleMute}
+                      className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-bold transition-all ${
+                        isMuted
+                          ? 'bg-[#FF6B6B]/20 border-[#FF6B6B]/40 text-[#FF6B6B] hover:bg-[#FF6B6B]/30'
+                          : isListening
+                          ? 'bg-[#B8F34A]/20 border-[#B8F34A]/40 text-[#B8F34A] hover:bg-[#B8F34A]/30'
+                          : 'bg-[#1B243B] border-[#26304A] text-[#AAB4CC] hover:text-[#F5F7FF]'
+                      }`}
+                    >
+                      {isMuted ? <MicOff className="h-3.5 w-3.5" /> : <Mic className="h-3.5 w-3.5" />}
+                      <span>{isMuted ? 'Unmute' : isListening ? 'Mute' : 'Start Mic'}</span>
+                    </button>
+
                     {isListening ? (
                       <button
                         onClick={stopSpeaking}
@@ -578,11 +939,11 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                       </button>
                     ) : (
                       <button
-                        onClick={startSpeaking}
+                        onClick={() => startSpeaking()}
                         className="inline-flex items-center gap-1.5 rounded-xl bg-[#7C5CFF] px-3.5 py-1.5 text-xs font-bold text-[#F5F7FF] shadow-sm hover:bg-[#9B7CFF] transition-all"
                       >
                         <Mic className="h-3.5 w-3.5" />
-                        <span>Start Speaking Answer</span>
+                        <span>Start Speaking</span>
                       </button>
                     )}
 
@@ -596,20 +957,46 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                   </div>
                 </div>
 
+                {/* Mic Error Banner with Retry in Question View */}
+                {micError && (
+                  <div className="rounded-xl border border-[#F5C451]/30 bg-[#F5C451]/10 p-3 text-xs text-[#F5C451] flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <AlertCircle className="h-4 w-4 shrink-0" />
+                      <span>{micError}</span>
+                    </div>
+                    <button
+                      onClick={() => startSpeaking()}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#F5C451]/20 hover:bg-[#F5C451]/30 border border-[#F5C451]/40 font-bold text-xs text-[#F5C451] transition-all"
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      <span>Retry Microphone</span>
+                    </button>
+                  </div>
+                )}
+
                 {/* Real-Time Live Transcript Preview */}
-                {(isListening || interimTranscript || currentScratchpad) && (
+                {(isListening || displayInterim || currentScratchpad) && (
                   <div className="rounded-xl border border-[#26304A] bg-[#1B243B] p-3 text-xs text-[#F5F7FF] space-y-1.5">
                     <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-[#9B7CFF]">
                       <span className="flex items-center gap-1">
                         <Sparkles className="h-3 w-3" />
-                        <span>Candidate Answer Buffer (Editable)</span>
+                        <span>Candidate Answer Buffer (Editable in Scratchpad)</span>
                       </span>
-                      <span className="font-mono text-[#B8F34A]">Auto-Saved</span>
+                      <span className="font-mono text-[#B8F34A]">
+                        {isSubmitting ? 'Evaluating...' : isFinishingTurn ? 'Finishing Turn...' : 'Auto-Saved'}
+                      </span>
                     </div>
-                    <p className="text-[#F5F7FF] font-medium leading-relaxed italic">
-                      {currentScratchpad ? `"${currentScratchpad}"` : ''}
-                      {interimTranscript ? <span className="text-[#9B7CFF] not-italic font-bold"> {interimTranscript}...</span> : null}
-                    </p>
+                    <div className="text-[#F5F7FF] font-medium leading-relaxed whitespace-pre-wrap">
+                      {currentScratchpad ? <span>{currentScratchpad}</span> : null}
+                      {displayInterim ? (
+                        <span className="text-[#9B7CFF] font-semibold italic"> {displayInterim}...</span>
+                      ) : null}
+                      {!currentScratchpad && !displayInterim && (
+                        <span className="text-[#737E98] italic text-xs">
+                          {isListening ? 'Listening for your response... Speak now.' : 'Start speaking or type your answer.'}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
@@ -621,6 +1008,20 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[#737E98] font-medium">
                   <span>Speak with microphone or type your technical answer below:</span>
                   <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleToggleMute}
+                      className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs font-bold transition-all ${
+                        isMuted
+                          ? 'bg-[#FF6B6B]/20 border-[#FF6B6B]/40 text-[#FF6B6B]'
+                          : isListening
+                          ? 'bg-[#B8F34A]/20 border-[#B8F34A]/40 text-[#B8F34A]'
+                          : 'bg-[#1B243B] border-[#26304A] text-[#AAB4CC] hover:text-[#F5F7FF]'
+                      }`}
+                    >
+                      {isMuted ? <MicOff className="h-3 w-3" /> : <Mic className="h-3 w-3" />}
+                      <span>{isMuted ? 'Unmute Mic' : isListening ? 'Mute Mic' : 'Start Mic'}</span>
+                    </button>
+
                     {isListening ? (
                       <button
                         onClick={stopSpeaking}
@@ -631,7 +1032,7 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                       </button>
                     ) : (
                       <button
-                        onClick={startSpeaking}
+                        onClick={() => startSpeaking()}
                         className="inline-flex items-center gap-1 rounded-lg bg-[#7C5CFF]/20 border border-[#7C5CFF]/40 px-2.5 py-1 text-xs font-bold text-[#9B7CFF] hover:bg-[#7C5CFF]/30"
                       >
                         <Mic className="h-3 w-3" />
@@ -643,11 +1044,20 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                   </div>
                 </div>
 
-                {/* Mic Error Banner if any */}
+                {/* Mic Error Banner with Retry in Scratchpad */}
                 {micError && (
-                  <div className="rounded-xl border border-[#F5C451]/30 bg-[#F5C451]/10 p-2.5 text-xs text-[#F5C451] flex items-center gap-2">
-                    <AlertCircle className="h-4 w-4 shrink-0" />
-                    <span>{micError}</span>
+                  <div className="rounded-xl border border-[#F5C451]/30 bg-[#F5C451]/10 p-2.5 text-xs text-[#F5C451] flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <AlertCircle className="h-4 w-4 shrink-0" />
+                      <span>{micError}</span>
+                    </div>
+                    <button
+                      onClick={() => startSpeaking()}
+                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#F5C451]/20 hover:bg-[#F5C451]/30 border border-[#F5C451]/40 font-bold text-xs text-[#F5C451] transition-all"
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      <span>Retry</span>
+                    </button>
                   </div>
                 )}
 
@@ -665,9 +1075,9 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                   className="w-full rounded-xl border border-[#26304A] bg-[#11182B] p-3 text-xs text-[#F5F7FF] font-mono leading-relaxed focus:border-[#7C5CFF] focus:outline-none"
                 />
 
-                {interimTranscript && (
+                {displayInterim && (
                   <div className="text-xs text-[#9B7CFF] italic bg-[#11182B] p-2 rounded-lg border border-[#26304A]">
-                    Listening: {interimTranscript}...
+                    Listening: {displayInterim}...
                   </div>
                 )}
               </div>
@@ -729,37 +1139,83 @@ export const LiveInterview: React.FC<LiveInterviewProps> = ({
                     isSubmitting ? 'bg-[#7C5CFF]/50 cursor-not-allowed' : 'bg-[#7C5CFF] hover:bg-[#9B7CFF] active:scale-95'
                   }`}
                 >
-                  <span>
-                    {activeQuestionIndex < totalQuestions - 1
-                      ? 'Submit Answer & Next Question'
-                      : 'Complete Interview & View Report'}
-                  </span>
-                  <ChevronRight className="h-3.5 w-3.5" />
+                  {isSubmitting ? (
+                    <>
+                      <div className="h-3.5 w-3.5 rounded-full border-2 border-white border-t-transparent animate-spin" />
+                      <span>Dr. Maya Responding...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>
+                        {activeQuestionIndex < totalQuestions - 1
+                          ? 'Submit Answer & Next Question'
+                          : 'Complete Interview & View Report'}
+                      </span>
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    </>
+                  )}
                 </button>
               </div>
             </div>
           </div>
 
+          {/* Live Closed Captions Floating Banner */}
+          {isCaptionsOn && (displayInterim || (isListening && !isMuted)) && (
+            <div className="rounded-xl bg-[#0B1020]/90 border border-[#7C5CFF]/40 p-2.5 text-xs text-[#F5F7FF] flex items-center gap-2 shadow-lg backdrop-blur-md">
+              <span className="h-2 w-2 rounded-full bg-[#B8F34A] animate-pulse shrink-0" />
+              <span className="font-bold text-[#9B7CFF] shrink-0 font-mono text-[11px]">LIVE CAPTIONS:</span>
+              <span className="italic truncate text-[#F5F7FF]">
+                {displayInterim ? `"${displayInterim}"` : 'Listening for vocal input...'}
+              </span>
+            </div>
+          )}
+
           {/* Media & Call Controls Footer */}
           <div className="flex items-center justify-center gap-3 rounded-2xl border border-[#26304A] bg-[#151D32] p-3 shadow-sm">
-            {/* Mic Toggle */}
+            {/* Mute/Unmute Toggle Button */}
             <button
-              onClick={() => {
-                if (isListening) {
-                  stopSpeaking();
-                } else {
-                  startSpeaking();
-                }
-              }}
-              className={`flex h-10 px-3 items-center gap-1.5 rounded-xl transition-all ${
-                isListening
-                  ? 'bg-[#FF6B6B] text-[#F5F7FF] shadow-lg shadow-[#FF6B6B]/20 animate-pulse font-bold text-xs'
-                  : 'bg-[#1B243B] text-[#F5F7FF] hover:bg-[#26304A] border border-[#26304A] text-xs font-bold'
+              onClick={handleToggleMute}
+              aria-label={isMuted ? 'Unmute microphone' : isListening ? 'Mute microphone' : 'Start microphone'}
+              aria-pressed={isListening}
+              className={`flex h-10 px-4 items-center gap-2 rounded-xl transition-all font-bold text-xs shadow-sm ${
+                isMuted
+                  ? 'bg-[#FF6B6B]/20 text-[#FF6B6B] border border-[#FF6B6B]/40 hover:bg-[#FF6B6B]/30'
+                  : isListening
+                  ? 'bg-[#B8F34A]/20 text-[#B8F34A] border border-[#B8F34A]/40 hover:bg-[#B8F34A]/30'
+                  : micState === 'error'
+                  ? 'bg-[#F5C451]/20 text-[#F5C451] border border-[#F5C451]/40 hover:bg-[#F5C451]/30'
+                  : 'bg-[#1B243B] text-[#F5F7FF] hover:bg-[#26304A] border border-[#26304A]'
               }`}
-              title={isListening ? 'Stop Speaking' : 'Start Speaking'}
+              title={
+                isMuted
+                  ? 'Click to Unmute Microphone'
+                  : isListening
+                  ? 'Click to Mute Microphone'
+                  : micState === 'error'
+                  ? 'Click to Retry Microphone'
+                  : 'Click to Start Microphone'
+              }
             >
-              {isListening ? <Mic className="h-4 w-4" /> : <MicOff className="h-4 w-4 text-[#737E98]" />}
-              <span>{isListening ? 'Listening...' : 'Unmuted'}</span>
+              {isMuted ? (
+                <MicOff className="h-4 w-4" />
+              ) : isListening ? (
+                <Mic className="h-4 w-4 text-[#B8F34A]" />
+              ) : micState === 'error' ? (
+                <RotateCcw className="h-4 w-4 text-[#F5C451]" />
+              ) : (
+                <Mic className="h-4 w-4" />
+              )}
+              <span>
+                {isMuted
+                  ? 'Muted'
+                  : isListening
+                  ? 'Mute'
+                  : micState === 'error'
+                  ? 'Retry'
+                  : micState === 'requesting'
+                  ? 'Connecting'
+                  : 'Start Mic'}
+              </span>
             </button>
 
             {/* Video Camera Toggle */}

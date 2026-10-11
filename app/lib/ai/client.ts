@@ -57,9 +57,10 @@ const KNOWN_CHAT_MODELS = [
   'openai/gpt-oss-20b',
   'qwen/qwen3.8-27b',
   'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
   'llama-3.1-70b-versatile',
-  'llama3-70b-8192',
-  'gpt-4o-mini'
+  'gpt-4o-mini',
+  'llama3-70b-8192'
 ];
 
 /**
@@ -73,13 +74,13 @@ export async function generateAIResponse<T = unknown>(
     userPrompt,
     temperature = 0.3,
     jsonMode = true,
-    timeoutMs = 45000
+    timeoutMs = 25000
   } = options;
 
   const openAiApiKey = process.env.OPENAI_API_KEY;
   const geminiApiKey = process.env.GEMINI_API_KEY;
-  const baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
-  const configuredModel = process.env.OPENAI_MODEL || 'openai/gpt-oss-120b';
+  const baseUrl = process.env.OPENAI_BASE_URL || 'https://api.groq.com/openai/v1';
+  const configuredModel = process.env.OPENAI_MODEL || 'llama-3.3-70b-versatile';
 
   // Check if any API key is configured
   if (!openAiApiKey && !geminiApiKey) {

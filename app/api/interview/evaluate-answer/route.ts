@@ -5,6 +5,12 @@ import { generateHeuristicEvaluation } from '../../../lib/ai/adaptiveEngine';
 import { parseScore } from '../../../lib/evaluation/scoring';
 import { AdaptiveDecision, QuestionData } from '../../../types/interview';
 
+interface ConversationTurn {
+  role: 'interviewer' | 'candidate';
+  content: string;
+  topic?: string;
+}
+
 interface EvaluateAnswerRequestBody {
   question?: string;
   candidateAnswer?: string;
@@ -14,9 +20,11 @@ interface EvaluateAnswerRequestBody {
   previousEvidence?: unknown[];
   currentDifficulty?: string;
   questionData?: QuestionData;
+  conversationHistory?: ConversationTurn[];
 }
 
 interface EvaluationResponseData {
+  conversationalResponse?: string;
   score: number;
   confidence: number;
   demonstratedKnowledge: string[];
@@ -48,18 +56,25 @@ export async function POST(req: NextRequest) {
       jobDescription = '',
       expectedEvidence = [],
       currentDifficulty = 'Medium',
-      questionData
+      questionData,
+      conversationHistory = []
     } = body;
 
-    const userPrompt = `Evaluate this candidate answer:
+    const formattedHistory = conversationHistory.length > 0
+      ? `Prior Conversation Context:\n${conversationHistory
+          .map(t => `${t.role === 'interviewer' ? 'Dr. Maya (Interviewer)' : 'Candidate'}: "${t.content}"`)
+          .join('\n')}\n\n`
+      : '';
+
+    const userPrompt = `${formattedHistory}Current Interview Turn to Evaluate:
 
 Question Asked:
 "${question || questionData?.question || 'Technical question'}"
 
-Skill / Focus: ${skill}
-Current Difficulty: ${currentDifficulty}
+Skill / Focus Area: ${skill}
+Current Difficulty Tier: ${currentDifficulty}
 
-Target Job Description Context:
+Target Job Description:
 """
 ${jobDescription || 'Standard engineering requirements'}
 """
@@ -72,9 +87,11 @@ Candidate's Actual Answer:
 ${candidateAnswer.trim() || 'Candidate provided no response or expressed uncertainty.'}
 """
 
-EVALUATION INSTRUCTIONS:
-1. Fairness to Conciseness: If the candidate's answer is concise (2-4 sentences) but accurately captures the core mechanism and trade-off, score it favorably (85-95). Do NOT penalize brevity or demand unprompted essays/code.
-2. Formulate a sharp, conversational 1-2 sentence follow-up question based directly on what the candidate just stated.`;
+EVALUATION & CONVERSATIONAL INSTRUCTIONS:
+1. "conversationalResponse": Speak back naturally to the candidate in 2-3 sentences. Acknowledge what they actually said (e.g. their specific choice of cache, database, partition key, or algorithm). Avoid generic filler.
+2. If the answer was vague or just buzzwords, politely ask for concrete implementation details. If sharp, challenge with failure modes or latency scale. If unsure, provide an encouraging pivot to a simpler concept.
+3. Do NOT repeat questions or topics from the Prior Conversation Context.
+4. "nextQuestion": Standalone prompt for the question scenario view.`;
 
     const aiResult = await generateAIResponse<EvaluationResponseData>({
       systemPrompt: ANSWER_EVALUATOR_SYSTEM_PROMPT,
@@ -91,8 +108,13 @@ EVALUATION INSTRUCTIONS:
         ? data.decision
         : 'continue_current_topic';
 
+      const defaultSpokenResponse = data.nextQuestion
+        ? `Makes sense. Let's look closer at this: ${data.nextQuestion}`
+        : 'Understood. Let us move to the next scenario.';
+
       return NextResponse.json({
         success: true,
+        conversationalResponse: data.conversationalResponse || defaultSpokenResponse,
         score: parseScore(data.score, 0),
         confidence: typeof data.confidence === 'number' && Number.isFinite(data.confidence)
           ? Math.min(1, Math.max(0, data.confidence))

@@ -213,6 +213,86 @@ export function resolveEffectiveAnswer(answer?: string, notes?: string): string 
 }
 
 /**
+ * Intelligently merges an incoming speech chunk into existing text.
+ * Prevents duplicate phrases, handles speech-recognition restart overlaps,
+ * and eliminates duplicate word appending at boundaries.
+ */
+export function appendSpeechText(existing: string = '', incoming: string = ''): string {
+  const current = (existing || '').trim();
+  const next = (incoming || '').trim();
+  if (!next) return current;
+  if (!current) return next;
+
+  // 1. Exact case-insensitive match
+  if (current.toLowerCase() === next.toLowerCase()) {
+    return current;
+  }
+
+  // 2. Incoming is a complete extension of current (e.g. "Hello" -> "Hello can you hear me")
+  if (next.toLowerCase().startsWith(current.toLowerCase())) {
+    return next;
+  }
+
+  // 3. Current already ends with incoming (e.g. "Hello can you hear me" -> "can you hear me")
+  if (current.toLowerCase().endsWith(next.toLowerCase())) {
+    return current;
+  }
+
+  // 4. Overlap detection on word boundaries (suffix of current matches prefix of incoming)
+  const currentWords = current.split(/\s+/);
+  const nextWords = next.split(/\s+/);
+  const maxOverlap = Math.min(currentWords.length, nextWords.length);
+
+  for (let len = maxOverlap; len > 0; len--) {
+    const currentSuffix = currentWords.slice(-len).join(' ').toLowerCase();
+    const nextPrefix = nextWords.slice(0, len).join(' ').toLowerCase();
+    if (currentSuffix === nextPrefix) {
+      const remaining = nextWords.slice(len).join(' ');
+      return remaining ? `${current} ${remaining}` : current;
+    }
+  }
+
+  // 5. Check if next is already contained in current as a standalone phrase
+  const cleanNext = next.replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').toLowerCase();
+  const cleanCurrent = current.replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, '').toLowerCase();
+  if (cleanCurrent.endsWith(cleanNext) || cleanCurrent.includes(` ${cleanNext}`)) {
+    return current;
+  }
+
+  return `${current} ${next}`;
+}
+
+/**
+ * Strips any prefix of interim speech that is already committed into the scratchpad.
+ * Used for live real-time UI rendering so interim speech never visibly duplicates
+ * what is already shown in the candidate answer buffer.
+ */
+export function getUncommittedInterim(scratchpad: string = '', interim: string = ''): string {
+  const current = (scratchpad || '').trim();
+  const next = (interim || '').trim();
+  if (!next) return '';
+  if (!current) return next;
+
+  if (current.toLowerCase().endsWith(next.toLowerCase())) {
+    return '';
+  }
+
+  const currentWords = current.split(/\s+/);
+  const nextWords = next.split(/\s+/);
+  const maxOverlap = Math.min(currentWords.length, nextWords.length);
+
+  for (let len = maxOverlap; len > 0; len--) {
+    const currentSuffix = currentWords.slice(-len).join(' ').toLowerCase();
+    const nextPrefix = nextWords.slice(0, len).join(' ').toLowerCase();
+    if (currentSuffix === nextPrefix) {
+      return nextWords.slice(len).join(' ');
+    }
+  }
+
+  return next;
+}
+
+/**
  * Combines pending finalized transcript and interim speech transcript with the current scratchpad text.
  * Prevents text duplication, handles speech-recognition race conditions, and preserves typed answers.
  */
@@ -225,24 +305,16 @@ export function composeFinalAnswer(
   const finalSpeech = (finalTranscript || '').trim();
   const interimSpeech = (interimTranscript || '').trim();
 
-  // 1. Merge finalized speech if not already present in scratchpad
+  // Merge finalized speech if present without duplicating words
   if (finalSpeech) {
-    if (!result) {
-      result = finalSpeech;
-    } else if (!result.includes(finalSpeech)) {
-      result = `${result}\n${finalSpeech}`.trim();
-    }
+    result = appendSpeechText(result, finalSpeech);
   }
 
-  // 2. Merge interim speech if not already present in scratchpad or finalized transcript
+  // Merge uncommitted interim speech if present
   if (interimSpeech) {
-    if (!result) {
-      result = interimSpeech;
-    } else if (!result.includes(interimSpeech)) {
-      result = `${result} ${interimSpeech}`.trim();
-    }
+    result = appendSpeechText(result, interimSpeech);
   }
 
-  return result;
+  return result.trim();
 }
 

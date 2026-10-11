@@ -51,6 +51,7 @@ export interface QuestionData {
   codeSnippet?: string;
   hints: string[];
   expectedKeyPoints: string[];
+  conversationalResponse?: string;
 }
 
 export interface InterviewConfig {
@@ -129,6 +130,7 @@ export interface EvaluationEvidence {
   confidence: number;
   followUpRecommendation: string;
   adaptiveDecision: AdaptiveDecision;
+  conversationalResponse?: string;
 }
 
 export interface InterviewSessionState {
